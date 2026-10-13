@@ -10,11 +10,12 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
+from contextvars import copy_context
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, ParamSpec, TypeVar, cast
 from uuid import uuid4
 
 from loguru import logger
@@ -70,6 +71,8 @@ BACKFILL_CONTENT = "[Tool result unavailable — call was interrupted or lost]"
 PLACEHOLDER_TEXTS = frozenset({
     "[Previous assistant message omitted.]",
 })
+_PreparationArgs = ParamSpec("_PreparationArgs")
+_PreparationResult = TypeVar("_PreparationResult")
 
 
 class ContextWindowExceededError(RuntimeError):
@@ -230,17 +233,6 @@ class ContextCompactionState:
     ) -> list[dict[str, Any]]:
         return deepcopy(request_messages[len(self.accepted_messages):])
 
-    def accept_request(
-        self,
-        model_messages: list[dict[str, Any]],
-        *,
-        raw_boundary: int,
-    ) -> None:
-        """Advance H after the provider has received one request."""
-        self.accepted_messages = deepcopy(model_messages)
-        self.raw_accepted_boundary = raw_boundary
-
-
 @dataclass(slots=True)
 class ModelRequestState:
     """Context state shared by every provider request in one runner turn."""
@@ -258,6 +250,48 @@ class ModelRequestState:
 
 class ContextGovernor:
     """Own model-request context while preserving persisted history."""
+
+    def __init__(self) -> None:
+        self._preparation_slots = asyncio.Semaphore(1)
+        self._preparation_jobs: set[Awaitable[object]] = set()
+
+    async def prepare_in_background(
+        self, operation: Callable[_PreparationArgs, _PreparationResult],
+        *args: _PreparationArgs.args, **kwargs: _PreparationArgs.kwargs,
+    ) -> _PreparationResult:
+        """Bound context preparation while leaving the shared pool available to clients."""
+        await self._preparation_slots.acquire()
+        context = copy_context()
+
+        def prepare() -> _PreparationResult:
+            return context.run(operation, *args, **kwargs)
+
+        try:
+            future = asyncio.get_running_loop().run_in_executor(None, prepare)
+        except BaseException:
+            self._preparation_slots.release()
+            raise
+        self._preparation_jobs.add(future)
+
+        def finished(done: asyncio.Future[_PreparationResult]) -> None:
+            self._preparation_jobs.discard(done)
+            self._preparation_slots.release()
+            if not done.cancelled():
+                done.exception()
+
+        future.add_done_callback(finished)
+        # Cancellation stops the caller immediately. The worker keeps its slot
+        # until the operation ends, even when nobody awaits its result.
+        return await asyncio.shield(future)
+
+    async def accept_request(
+        self, state: ModelRequestState, model_messages: list[dict[str, Any]],
+        *, raw_boundary: int,
+    ) -> None:
+        """Advance accepted history on the loop after making its detached copy."""
+        accepted = await self.prepare_in_background(deepcopy, model_messages)
+        state.compaction.accepted_messages = accepted
+        state.compaction.raw_accepted_boundary = raw_boundary
 
     @staticmethod
     def _merge_message_content(left: Any, right: Any) -> str | list[dict[str, Any]]:
@@ -623,7 +657,9 @@ class ContextGovernor:
         transcript: list[dict[str, Any]] | None = None,
     ) -> tuple[list[dict[str, Any]], ProviderCallContext | None]:
         """Prepare or compact and record the exact provider payload."""
-        prepared = self.prepare_messages_for_model(state.config, messages)
+        prepared = await self.prepare_in_background(
+            self.prepare_messages_for_model, state.config, messages,
+        )
         model_messages: list[dict[str, Any]] | None = prepared
         supplemental_messages: list[dict[str, Any]] | None = None
         request_context_tokens = None
@@ -642,7 +678,8 @@ class ContextGovernor:
             and prepared == state.messages
             and tool_definitions == state.tool_definitions
         )
-        pressure = self.request_pressure(
+        pressure = await self.prepare_in_background(
+            self.request_pressure,
             state.config,
             prepared,
             state.usage,
@@ -692,9 +729,17 @@ class ContextGovernor:
             provider_context = replace(
                 provider_context or ProviderCallContext(), events=state.events,
             )
-        state.messages = deepcopy(prepared)
-        state.tool_definitions = deepcopy(tool_definitions)
+        state.messages, state.tool_definitions = await self.prepare_in_background(
+            self._request_snapshot, prepared, tool_definitions,
+        )
         return prepared, provider_context
+
+    @staticmethod
+    def _request_snapshot(
+        messages: list[dict[str, Any]],
+        tool_definitions: list[dict[str, Any]] | None,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]] | None]:
+        return deepcopy(messages), deepcopy(tool_definitions)
 
     @staticmethod
     def input_budget(config: ContextGovernanceConfig) -> int:

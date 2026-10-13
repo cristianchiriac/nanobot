@@ -737,9 +737,10 @@ class AgentLoop:
             runtime_context_blocks=ctx.runtime_context_blocks,
         )
 
-    def _request_context_for_turn(self, ctx: TurnContext) -> RequestContext:
+    async def _request_context_for_turn(self, ctx: TurnContext) -> RequestContext:
         assert ctx.session is not None
-        scope = self.workspace_scopes.for_turn(
+        scope = await self.runner.prepare_prompt(
+            self.workspace_scopes.for_turn,
             channel=ctx.delivery.route.channel,
             message_metadata=ctx.msg.metadata,
             session_metadata=ctx.session.metadata,
@@ -784,8 +785,10 @@ class AgentLoop:
         ]
         blocks = runtime_context_blocks_from_metadata(request.metadata)
         blocks.extend(await resolve_runtime_context(providers, request))
-        skill_context = self.context.skills.build_explicit_skill_runtime_context(
-            request.original_user_text or ""
+        text = request.original_user_text or ""
+        skill_context = (
+            await self.runner.prepare_prompt(self.context.skills.build_explicit_skill_runtime_context, text)
+            if "$" in text else None
         )
         if skill_context is not None and skill_context not in blocks:
             blocks.append(skill_context)
@@ -963,7 +966,7 @@ class AgentLoop:
         session_key: str,
     ) -> EventSink:
         """Bind one idle compaction to its current user-facing destination."""
-        session = self.sessions.state.peek(session_key)
+        session = self.sessions.state.peek_header(session_key)
         if session is None:
             return NO_EVENTS
         return self.turn_delivery_factory.session_events(
@@ -1392,7 +1395,7 @@ class AgentLoop:
                     continue
                 if (
                     msg.require_existing_session
-                    and self.sessions.state.peek(effective_key) is None
+                    and self.sessions.state.peek_header(effective_key) is None
                 ):
                     continue
                 if msg.is_user_input:
@@ -1512,7 +1515,7 @@ class AgentLoop:
                     msg = deferred.pop(0)
                     if not deferred:
                         self._deferred_automation_turns.pop(session_key)
-                session = self.sessions.state.peek(session_key)
+                session = self.sessions.state.peek_header(session_key)
                 log_content = session is None or (
                     session.policy.persist and session.policy.log_content
                 )
@@ -1564,7 +1567,7 @@ class AgentLoop:
         session_key = self._effective_session_key(msg)
         # The request context is reset before errors reach this boundary, and
         # discard may evict the session while a turn is still unwinding.
-        session = self.sessions.state.peek(session_key)
+        session = self.sessions.state.peek_header(session_key)
         log_content = session is None or (
             session.policy.persist and session.policy.log_content
         )
@@ -2130,7 +2133,9 @@ class AgentLoop:
             session = ctx.require_session()
         is_subagent = ctx.kind is TurnKind.SYSTEM and ctx.msg.sender_id == "subagent"
 
-        ctx.history = session.get_history(extend_to_user=is_subagent)
+        ctx.history = await self.runner.prepare_prompt(
+            session.get_history, extend_to_user=is_subagent,
+        )
         stored_state = session.provider_state
         subagent_followup_persisted = False
         if is_subagent:
@@ -2153,7 +2158,7 @@ class AgentLoop:
             ctx.input_persisted_early = True
         await ctx.delivery.runtime_admitted(runtime)
 
-        ctx.request_context = self._request_context_for_turn(ctx)
+        ctx.request_context = await self._request_context_for_turn(ctx)
         if ctx.kind is TurnKind.USER:
             ctx.runtime_context_blocks = await self._resolve_runtime_context_for_turn(ctx)
         staged_provider_state = False
@@ -2649,7 +2654,7 @@ class AgentLoop:
                     return await self._process_message(msg, **kwargs)
                 finally:
                     if temporary_parent:
-                        parent = self.sessions.state.peek(session_key)
+                        parent = self.sessions.state.peek_header(session_key)
                         if parent is not None and not parent.policy.persist:
                             await self.sessions.state.delete(session_key, expected_generation=parent.generation)
         finally:
